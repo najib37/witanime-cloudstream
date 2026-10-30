@@ -1,0 +1,44 @@
+[
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=foxtrend.app&sz=%size%",
+        "fileHash": "sha256-d3a4bcceb6e0f8120f37eeb006d014f4d9a2126121612d8953b7228e9d58d58d",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/najib37/witanime-cloudstream",
+        "fileSize": 20919,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "najib"
+        ],
+        "tvTypes": [
+            "Live"
+        ],
+        "version": 2,
+        "internalName": "FoxTrendProvider",
+        "description": "FoxTrend / StreamEast sports (via foxlink.buzz) \u2014 live F1, football, NBA, NFL and more",
+        "url": "https://raw.githubusercontent.com/najib37/witanime-cloudstream/builds/FoxTrendProvider.cs3",
+        "name": "FoxTrendProvider"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=witanime.site&sz=%size%",
+        "fileHash": "sha256-04bb4d05e1e45b00310c79fe944d2850b8b679440a5032f19153e97fcfdcda25",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/najib37/witanime-cloudstream",
+        "fileSize": 44923,
+        "status": 1,
+        "language": "ar",
+        "authors": [
+            "najib"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie",
+            "OVA"
+        ],
+        "version": 5,
+        "internalName": "WitAnimeProvider",
+        "description": "WitAnime - \u0623\u0646\u0645\u064a \u0645\u062a\u0631\u062c\u0645 \u0623\u0648\u0646 \u0644\u0627\u064a\u0646",
+        "url": "https://raw.githubusercontent.com/najib37/witanime-cloudstream/builds/WitAnimeProvider.cs3",
+        "name": "WitAnimeProvider"
+    }
+]
