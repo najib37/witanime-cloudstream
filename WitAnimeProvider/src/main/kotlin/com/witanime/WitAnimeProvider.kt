@@ -234,8 +234,10 @@ class WitAnimeProvider : MainAPI() {
             // One ok.ru embed already lists every quality, so its other tokens add nothing.
             .distinctBy { if (it.label == "ok") Triple(it.label, it.version, it.lang) else it }
             .sortedBy { rank(HOST_PRIORITY, it.label) }
+        // A download server with the same host and quality as a stream server is the same file
+        val streamKeys = streams.map { it.label to it.quality }.toSet()
         val downloads = sources
-            .filter { it.kind == "download" && it.label in DOWNLOAD_HOSTS }
+            .filter { it.kind == "download" && it.label in DOWNLOAD_HOSTS && (it.label to it.quality) !in streamKeys }
             .sortedBy { rank(QUALITY_ORDER, it.quality) }
         val picked = (streams + downloads).take(MAX_RESOLVES)
         log("picked ${picked.map { "${it.kind[0]}:${it.label}/${it.quality}" }} of ${sources.size}")
