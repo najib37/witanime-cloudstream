@@ -1,5 +1,6 @@
 package com.witanime
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.*
@@ -112,7 +113,8 @@ class WitAnimeProvider : MainAPI() {
         val banner = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?.takeIf { "/banners/" in it }
         val description = doc.selectFirst("p.leading-relaxed")?.text()
-        val tags = doc.select("span.rounded-full").map { it.text().trim() }.filter { it.isNotBlank() }
+        val tags = doc.select("div.flex-wrap.gap-2 > span.rounded-full")
+            .map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
         val info = doc.infoGrid()
         val year = info["السنة"]?.toIntOrNull()
         val duration = info["المدة"]?.filter { it.isDigit() }?.toIntOrNull()
@@ -191,6 +193,9 @@ class WitAnimeProvider : MainAPI() {
      *
      * The site allows ~20 requests per window per IP, so servers are resolved one at a
      * time, best known hosts first, capped at [MAX_SERVERS].
+     *
+     * The sources endpoint 404s a full-version Chrome User-Agent that comes without matching
+     * client hints, so every request here sends [BROWSER_HEADERS].
      */
     override suspend fun loadLinks(
         data: String,
@@ -199,16 +204,16 @@ class WitAnimeProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val cookies = mutableMapOf<String, String>()
-        val page = app.get(data)
+        val page = app.get(data, headers = BROWSER_HEADERS)
         cookies.putAll(page.cookies)
         val html = page.text
 
         val csrf = Regex("""name="csrf-token" content="([^"]+)"""").find(html)?.groupValues?.get(1)
-            ?: return false
         val sourcesUrl = Regex("""sourcesUrl:\s*'([^']+)'""").find(html)?.groupValues?.get(1)
             ?.replace("\\/", "/")
-            ?: return false
-        val headers = mapOf(
+        log("watch $data -> ${page.code}, ${html.length} chars, csrf=${csrf != null}, sourcesUrl=$sourcesUrl, cookies=${cookies.keys}")
+        if (csrf == null || sourcesUrl == null) return false
+        val headers = BROWSER_HEADERS + mapOf(
             "Accept" to "application/json",
             "X-CSRF-TOKEN" to csrf,
             "X-Requested-With" to "XMLHttpRequest",
@@ -216,8 +221,10 @@ class WitAnimeProvider : MainAPI() {
 
         val manifestRes = app.post(fixUrl(sourcesUrl), headers = headers, cookies = cookies, referer = data)
         cookies.putAll(manifestRes.cookies)
+        log("sources -> ${manifestRes.code}: ${manifestRes.text.take(200)}")
         // Empty groups come back as [] rather than {}, so optJSONObject keeps that from throwing.
-        val players = JSONObject(manifestRes.text).optJSONObject("players") ?: return false
+        val players = runCatching { JSONObject(manifestRes.text).optJSONObject("players") }.getOrNull()
+            ?: return false
 
         val sources = mutableListOf<Source>()
         for (quality in players.keys()) {
@@ -241,6 +248,7 @@ class WitAnimeProvider : MainAPI() {
             .distinctBy { Triple(it.label, it.version, it.lang) }
             .sortedBy { HOST_PRIORITY.indexOf(it.label).let { i -> if (i < 0) HOST_PRIORITY.size else i } }
             .take(MAX_SERVERS)
+        log("picked ${picked.map { "${it.label}/${it.quality}" }} of ${sources.size}")
 
         var found = false
         for (source in picked) {
@@ -256,9 +264,10 @@ class WitAnimeProvider : MainAPI() {
             val gate = throttled {
                 app.get(
                     "$mainUrl/watch/stream-gate/${source.token}",
-                    cookies = cookies, allowRedirects = false
+                    headers = BROWSER_HEADERS, cookies = cookies, allowRedirects = false
                 )
             }
+            log("${source.label}: source -> ${resolve.code}, gate -> ${gate.code} ${gate.headers["location"]}")
             if (gate.code !in 200..399) continue
             cookies.putAll(gate.cookies)
             val embed = gate.headers["location"]
@@ -266,13 +275,17 @@ class WitAnimeProvider : MainAPI() {
                 ?: continue
 
             val quality = qualityOf(source.quality)
-            found = loadExtractor(embed, "$mainUrl/", subtitleCallback) { link ->
+            val extracted = loadExtractor(embed, "$mainUrl/", subtitleCallback) { link ->
                 if (link.quality == Qualities.Unknown.value) link.quality = quality
                 callback(link)
-            } || found
+            }
+            log("${source.label}: extractor -> $extracted")
+            found = extracted || found
         }
         return found
     }
+
+    private fun log(message: String) = Log.d("WitAnime", message)
 
     // Besides the per-window limit, the site rejects bursts with 429, so space requests out
     // and give each one a single retry.
@@ -293,12 +306,18 @@ class WitAnimeProvider : MainAPI() {
     }
 
     companion object {
+        private val BROWSER_HEADERS = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            "sec-ch-ua" to "\"Chromium\";v=\"149\", \"Google Chrome\";v=\"149\", \"Not.A/Brand\";v=\"99\"",
+            "sec-ch-ua-mobile" to "?0",
+            "sec-ch-ua-platform" to "\"Windows\"",
+        )
         private const val MAX_SERVERS = 5
         private const val REQUEST_GAP_MS = 2500L
         private const val RETRY_GAP_MS = 6000L
         private val QUALITY_ORDER = listOf("4K", "FHD", "HD", "SD")
         private val HOST_PRIORITY = listOf("ok", "mp4upload", "videa", "hgcloud")
         // No CloudStream extractor exists for these (yonaplay is itself a server picker)
-        private val UNSUPPORTED_HOSTS = setOf("mega", "workupload", "yonaplay", "videas")
+        private val UNSUPPORTED_HOSTS = setOf("mega", "workupload", "yonaplay", "videas", "4shared")
     }
 }
