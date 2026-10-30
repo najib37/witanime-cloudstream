@@ -231,8 +231,8 @@ class WitAnimeProvider : MainAPI() {
         val streams = sources
             .filter { it.kind == "stream" && it.label !in UNSUPPORTED_HOSTS }
             .sortedBy { rank(QUALITY_ORDER, it.quality) }
-            // One ok.ru embed already lists every quality, so its other tokens add nothing.
-            .distinctBy { if (it.label == "ok") Triple(it.label, it.version, it.lang) else it }
+            // One embed of these hosts already lists every quality, so their other tokens add nothing.
+            .distinctBy { if (it.label in ALL_QUALITY_HOSTS) Triple(it.label, it.version, it.lang) else it }
             .sortedBy { rank(HOST_PRIORITY, it.label) }
         // A download server with the same host and quality as a stream server is the same file
         val streamKeys = streams.map { it.label to it.quality }.toSet()
@@ -285,10 +285,8 @@ class WitAnimeProvider : MainAPI() {
                     callback(link)
                 }
             }
-            runCatching {
-                if ("ok.ru/" in embed) extractOkRu(embed, emit)
-                else loadExtractor(embed, "$mainUrl/", subtitleCallback, emit)
-            }.onFailure { log("${source.label}: ${it.message}") }
+            runCatching { Hosts.extract(embed, "$mainUrl/", subtitleCallback, emit) }
+                .onFailure { log("${source.label}: $it") }
             log("${source.label}/${source.quality}: $emitted link(s)")
             found = found || emitted > 0
         }
@@ -312,34 +310,6 @@ class WitAnimeProvider : MainAPI() {
                 )
             }
         }.toList()
-    }
-
-    /**
-     * CloudStream's built-in ok.ru extractor expects backslash-escaped JSON that the embed no
-     * longer has, so it finds nothing. The embed's data-options attribute holds a
-     * flashvars.metadata object (or JSON string) whose "videos" lists one mp4 per quality.
-     */
-    private suspend fun extractOkRu(url: String, callback: (ExtractorLink) -> Unit) {
-        val embedUrl = url.replace("/video/", "/videoembed/")
-        val options = app.get(embedUrl, headers = BROWSER_HEADERS).document
-            .selectFirst("[data-options]")?.attr("data-options") ?: return
-        val flashvars = JSONObject(options).optJSONObject("flashvars") ?: return
-        val metadata = flashvars.optJSONObject("metadata")
-            ?: flashvars.optString("metadata").takeIf { it.isNotBlank() }?.let { JSONObject(it) }
-            ?: return
-        val videos = metadata.optJSONArray("videos") ?: return
-        for (i in 0 until videos.length()) {
-            val video = videos.optJSONObject(i) ?: continue
-            val videoUrl = video.optString("url").ifBlank { continue }
-                .let { if (it.startsWith("//")) "https:$it" else it }
-            callback(
-                newExtractorLink("Ok.ru", "Ok.ru", videoUrl, ExtractorLinkType.VIDEO) {
-                    referer = "https://ok.ru/"
-                    quality = OK_RU_QUALITIES[video.optString("name")] ?: Qualities.Unknown.value
-                    headers = mapOf("User-Agent" to BROWSER_HEADERS.getValue("User-Agent"))
-                }
-            )
-        }
     }
 
     private fun rank(order: List<String>, value: String) = order.indexOf(value).let { if (it < 0) order.size else it }
@@ -377,24 +347,16 @@ class WitAnimeProvider : MainAPI() {
         private const val GATE_GAP_MS = 1000L
         private const val RETRY_GAP_MS = 6000L
         private val QUALITY_ORDER = listOf("4K", "FHD", "HD", "SD")
-        private val HOST_PRIORITY = listOf("ok", "mp4upload")
-        // No working extractor for these: mega, workupload, videas and 4shared have none,
-        // yonaplay is itself a server picker, hgcloud only builds its player in JS, and
-        // CloudStream's videa extractor returns nothing for these embeds.
-        private val UNSUPPORTED_HOSTS = setOf("mega", "workupload", "yonaplay", "videas", "4shared", "hgcloud", "videa")
+        // Resolved in this order; see Hosts for how each one is extracted
+        private val HOST_PRIORITY = listOf("ok", "mp4upload", "videas", "4shared", "yonaplay")
+        // Hosts where one embed lists every quality
+        private val ALL_QUALITY_HOSTS = setOf("ok", "videas", "yonaplay")
+        // mega is end-to-end encrypted, hgcloud builds its player in obfuscated JS, workupload
+        // has no extractor, and videa's signed links were rejected (403) by the player on device
+        private val UNSUPPORTED_HOSTS = setOf("mega", "hgcloud", "workupload", "videa")
         // Download servers worth resolving: mediafire serves .zip archives and gofile's API
         // rate-limits guest accounts.
         private val DOWNLOAD_HOSTS = setOf("mp4upload")
         private val MP4UPLOAD_ID = Regex("""mp4upload\.com/(?:embed-)?([a-z0-9]+)""")
-        private val OK_RU_QUALITIES = mapOf(
-            "mobile" to Qualities.P144.value,
-            "lowest" to Qualities.P240.value,
-            "low" to Qualities.P360.value,
-            "sd" to Qualities.P480.value,
-            "hd" to Qualities.P720.value,
-            "full" to Qualities.P1080.value,
-            "quad" to Qualities.P1440.value,
-            "ultra" to Qualities.P2160.value,
-        )
     }
 }
