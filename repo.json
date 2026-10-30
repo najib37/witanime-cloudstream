@@ -1,0 +1,8 @@
+{
+    "name": "WitAnime",
+    "description": "WitAnime (witanime.site) provider for CloudStream",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/najib37/witanime-cloudstream/builds/plugins.json"
+    ]
+}
