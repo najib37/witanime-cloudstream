@@ -178,6 +178,7 @@ class WitAnimeProvider : MainAPI() {
         }
 
     private data class Source(
+        val kind: String, // "stream" or "download", which picks the /watch/{kind}-source and -gate endpoints
         val token: String,
         val label: String,
         val quality: String,
@@ -191,8 +192,10 @@ class WitAnimeProvider : MainAPI() {
      * and then reading the redirect from /watch/stream-gate/{token} (requested without a
      * Referer, matching the page's no-referrer iframe). Every step needs the same session.
      *
-     * The site allows ~20 requests per window per IP, so servers are resolved one at a
-     * time, best known hosts first, capped at [MAX_SERVERS].
+     * Download servers work the same way through /watch/download-source and -gate.
+     *
+     * The sources endpoints allow 20 requests per window per IP, so servers are resolved
+     * one at a time, best hosts first, capped at [MAX_RESOLVES].
      *
      * The sources endpoint 404s a full-version Chrome User-Agent that comes without matching
      * client hints, so every request here sends [BROWSER_HEADERS].
@@ -222,75 +225,129 @@ class WitAnimeProvider : MainAPI() {
         val manifestRes = app.post(fixUrl(sourcesUrl), headers = headers, cookies = cookies, referer = data)
         cookies.putAll(manifestRes.cookies)
         log("sources -> ${manifestRes.code}: ${manifestRes.text.take(200)}")
-        // Empty groups come back as [] rather than {}, so optJSONObject keeps that from throwing.
-        val players = runCatching { JSONObject(manifestRes.text).optJSONObject("players") }.getOrNull()
-            ?: return false
+        val manifest = runCatching { JSONObject(manifestRes.text) }.getOrNull() ?: return false
+        val sources = manifest.sourcesIn("players", "stream") + manifest.sourcesIn("downloads", "download")
 
-        val sources = mutableListOf<Source>()
-        for (quality in players.keys()) {
-            val list = players.optJSONArray(quality) ?: continue
-            for (i in 0 until list.length()) {
-                val s = list.optJSONObject(i) ?: continue
-                sources += Source(
-                    token = s.optString("token"),
+        val streams = sources
+            .filter { it.kind == "stream" && it.label !in UNSUPPORTED_HOSTS }
+            .sortedBy { rank(QUALITY_ORDER, it.quality) }
+            // One ok.ru embed already lists every quality, so its other tokens add nothing.
+            .distinctBy { if (it.label == "ok") Triple(it.label, it.version, it.lang) else it }
+            .sortedBy { rank(HOST_PRIORITY, it.label) }
+        val downloads = sources
+            .filter { it.kind == "download" && it.label in DOWNLOAD_HOSTS }
+            .sortedBy { rank(QUALITY_ORDER, it.quality) }
+        val picked = (streams + downloads).take(MAX_RESOLVES)
+        log("picked ${picked.map { "${it.kind[0]}:${it.label}/${it.quality}" }} of ${sources.size}")
+
+        val seenEmbeds = mutableSetOf<String>()
+        val seenUrls = mutableSetOf<String>()
+        var found = false
+        for (source in picked) {
+            val resolve = throttled(REQUEST_GAP_MS) {
+                app.post(
+                    "$mainUrl/watch/${source.kind}-source/${source.token}",
+                    headers = headers, cookies = cookies, referer = data
+                )
+            }
+            if (!resolve.isSuccessful) {
+                log("${source.label}/${source.quality}: source -> ${resolve.code}")
+                // Still limited after the retry: every later request would be too
+                if (resolve.code == 429) break
+                continue
+            }
+            cookies.putAll(resolve.cookies)
+
+            // The gate endpoint has its own, separate limit
+            val gate = throttled(GATE_GAP_MS) {
+                app.get(
+                    "$mainUrl/watch/${source.kind}-gate/${source.token}",
+                    headers = BROWSER_HEADERS, cookies = cookies, allowRedirects = false
+                )
+            }
+            cookies.putAll(gate.cookies)
+            val embed = gate.headers["location"]
+                ?: gate.document.selectFirst("iframe[src]")?.attr("src")
+            log("${source.label}/${source.quality}: gate -> ${gate.code} $embed")
+            if (embed == null) continue
+            // Download servers often point at the same mp4upload file as a stream server
+            val embedKey = MP4UPLOAD_ID.find(embed)?.groupValues?.get(1) ?: embed
+            if (!seenEmbeds.add(embedKey)) continue
+
+            val quality = qualityOf(source.quality)
+            var emitted = 0
+            val emit: (ExtractorLink) -> Unit = { link ->
+                if (seenUrls.add(link.url)) {
+                    if (link.quality == Qualities.Unknown.value) link.quality = quality
+                    emitted++
+                    callback(link)
+                }
+            }
+            runCatching {
+                if ("ok.ru/" in embed) extractOkRu(embed, emit)
+                else loadExtractor(embed, "$mainUrl/", subtitleCallback, emit)
+            }.onFailure { log("${source.label}: ${it.message}") }
+            log("${source.label}/${source.quality}: $emitted link(s)")
+            found = found || emitted > 0
+        }
+        return found
+    }
+
+    private fun JSONObject.sourcesIn(group: String, kind: String): List<Source> {
+        // Empty groups come back as [] rather than {}, so optJSONObject keeps that from throwing.
+        val byQuality = optJSONObject(group) ?: return emptyList()
+        return byQuality.keys().asSequence().flatMap { quality ->
+            val list = byQuality.optJSONArray(quality) ?: return@flatMap emptySequence()
+            (0 until list.length()).asSequence().mapNotNull { i ->
+                val s = list.optJSONObject(i) ?: return@mapNotNull null
+                Source(
+                    kind = kind,
+                    token = s.optString("token").ifBlank { return@mapNotNull null },
                     label = s.optString("label").lowercase(),
                     quality = quality,
                     version = s.optString("version", "sub"),
                     lang = s.optString("lang", "jp"),
                 )
             }
-        }
-
-        // One entry per host/version/lang, keeping its best quality, best hosts first.
-        val picked = sources
-            .filter { it.label !in UNSUPPORTED_HOSTS && it.token.isNotBlank() }
-            .sortedBy { QUALITY_ORDER.indexOf(it.quality).let { i -> if (i < 0) QUALITY_ORDER.size else i } }
-            .distinctBy { Triple(it.label, it.version, it.lang) }
-            .sortedBy { HOST_PRIORITY.indexOf(it.label).let { i -> if (i < 0) HOST_PRIORITY.size else i } }
-            .take(MAX_SERVERS)
-        log("picked ${picked.map { "${it.label}/${it.quality}" }} of ${sources.size}")
-
-        var found = false
-        for (source in picked) {
-            val resolve = throttled {
-                app.post(
-                    "$mainUrl/watch/stream-source/${source.token}",
-                    headers = headers, cookies = cookies, referer = data
-                )
-            }
-            if (!resolve.isSuccessful) continue
-            cookies.putAll(resolve.cookies)
-
-            val gate = throttled {
-                app.get(
-                    "$mainUrl/watch/stream-gate/${source.token}",
-                    headers = BROWSER_HEADERS, cookies = cookies, allowRedirects = false
-                )
-            }
-            log("${source.label}: source -> ${resolve.code}, gate -> ${gate.code} ${gate.headers["location"]}")
-            if (gate.code !in 200..399) continue
-            cookies.putAll(gate.cookies)
-            val embed = gate.headers["location"]
-                ?: gate.document.selectFirst("iframe[src]")?.attr("src")
-                ?: continue
-
-            val quality = qualityOf(source.quality)
-            val extracted = loadExtractor(embed, "$mainUrl/", subtitleCallback) { link ->
-                if (link.quality == Qualities.Unknown.value) link.quality = quality
-                callback(link)
-            }
-            log("${source.label}: extractor -> $extracted")
-            found = extracted || found
-        }
-        return found
+        }.toList()
     }
+
+    /**
+     * CloudStream's built-in ok.ru extractor expects backslash-escaped JSON that the embed no
+     * longer has, so it finds nothing. The embed's data-options attribute holds a
+     * flashvars.metadata object (or JSON string) whose "videos" lists one mp4 per quality.
+     */
+    private suspend fun extractOkRu(url: String, callback: (ExtractorLink) -> Unit) {
+        val embedUrl = url.replace("/video/", "/videoembed/")
+        val options = app.get(embedUrl, headers = BROWSER_HEADERS).document
+            .selectFirst("[data-options]")?.attr("data-options") ?: return
+        val flashvars = JSONObject(options).optJSONObject("flashvars") ?: return
+        val metadata = flashvars.optJSONObject("metadata")
+            ?: flashvars.optString("metadata").takeIf { it.isNotBlank() }?.let { JSONObject(it) }
+            ?: return
+        val videos = metadata.optJSONArray("videos") ?: return
+        for (i in 0 until videos.length()) {
+            val video = videos.optJSONObject(i) ?: continue
+            val videoUrl = video.optString("url").ifBlank { continue }
+                .let { if (it.startsWith("//")) "https:$it" else it }
+            callback(
+                newExtractorLink("Ok.ru", "Ok.ru", videoUrl, ExtractorLinkType.VIDEO) {
+                    referer = "https://ok.ru/"
+                    quality = OK_RU_QUALITIES[video.optString("name")] ?: Qualities.Unknown.value
+                    headers = mapOf("User-Agent" to BROWSER_HEADERS.getValue("User-Agent"))
+                }
+            )
+        }
+    }
+
+    private fun rank(order: List<String>, value: String) = order.indexOf(value).let { if (it < 0) order.size else it }
 
     private fun log(message: String) = Log.d("WitAnime", message)
 
     // Besides the per-window limit, the site rejects bursts with 429, so space requests out
     // and give each one a single retry.
-    private suspend fun throttled(request: suspend () -> NiceResponse): NiceResponse {
-        delay(REQUEST_GAP_MS)
+    private suspend fun throttled(gapMs: Long, request: suspend () -> NiceResponse): NiceResponse {
+        delay(gapMs)
         val res = request()
         if (res.code != 429) return res
         delay(RETRY_GAP_MS)
@@ -312,12 +369,30 @@ class WitAnimeProvider : MainAPI() {
             "sec-ch-ua-mobile" to "?0",
             "sec-ch-ua-platform" to "\"Windows\"",
         )
-        private const val MAX_SERVERS = 5
+        // 1 manifest request + this many source requests stays under the 20-per-window limit
+        private const val MAX_RESOLVES = 12
         private const val REQUEST_GAP_MS = 2500L
+        private const val GATE_GAP_MS = 1000L
         private const val RETRY_GAP_MS = 6000L
         private val QUALITY_ORDER = listOf("4K", "FHD", "HD", "SD")
-        private val HOST_PRIORITY = listOf("ok", "mp4upload", "videa", "hgcloud")
-        // No CloudStream extractor exists for these (yonaplay is itself a server picker)
-        private val UNSUPPORTED_HOSTS = setOf("mega", "workupload", "yonaplay", "videas", "4shared")
+        private val HOST_PRIORITY = listOf("ok", "mp4upload")
+        // No working extractor for these: mega, workupload, videas and 4shared have none,
+        // yonaplay is itself a server picker, hgcloud only builds its player in JS, and
+        // CloudStream's videa extractor returns nothing for these embeds.
+        private val UNSUPPORTED_HOSTS = setOf("mega", "workupload", "yonaplay", "videas", "4shared", "hgcloud", "videa")
+        // Download servers worth resolving: mediafire serves .zip archives and gofile's API
+        // rate-limits guest accounts.
+        private val DOWNLOAD_HOSTS = setOf("mp4upload")
+        private val MP4UPLOAD_ID = Regex("""mp4upload\.com/(?:embed-)?([a-z0-9]+)""")
+        private val OK_RU_QUALITIES = mapOf(
+            "mobile" to Qualities.P144.value,
+            "lowest" to Qualities.P240.value,
+            "low" to Qualities.P360.value,
+            "sd" to Qualities.P480.value,
+            "hd" to Qualities.P720.value,
+            "full" to Qualities.P1080.value,
+            "quad" to Qualities.P1440.value,
+            "ultra" to Qualities.P2160.value,
+        )
     }
 }
