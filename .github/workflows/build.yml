@@ -45,7 +45,8 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/src
           chmod +x gradlew
-          ./gradlew make makePluginsJson
+          # JitPack sometimes fails to serve the cloudstream gradle plugin snapshot; retry once
+          ./gradlew make makePluginsJson || { sleep 60; ./gradlew make makePluginsJson --refresh-dependencies; }
           cp **/build/*.cs3 $GITHUB_WORKSPACE/builds
           cp build/plugins.json $GITHUB_WORKSPACE/builds
 
