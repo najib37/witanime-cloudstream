@@ -146,15 +146,15 @@ class FoxTrendProvider : MainAPI() {
         val origin = originOf(data) ?: return false
         val doc = app.get(data, referer = "${base()}/").document
 
+        // Gather each server's embed URL. The player lives inside the embed; loading the embed
+        // itself (so it is the WebView's top frame) lets the injected play-trigger reach it.
         val servers = linkedMapOf<String, String>() // embedUrl -> label
         fun add(label: String, src: String?) {
-            val embed = src?.let { absUrl(it, origin) }?.takeIf { it.startsWith("http") } ?: return
+            val embed = src?.let { fixProto(it) }?.takeIf { it.startsWith("http") } ?: return
             if (!servers.containsKey(embed)) servers[embed] = label.ifBlank { "Server ${servers.size + 1}" }
         }
-
-        val activeLabel = doc.selectFirst("a.sr.sr-on")?.cleanLabel() ?: "Main"
-        add(activeLabel, doc.selectFirst("iframe#streamIframe, iframe[src]")?.attr("src"))
-
+        add(doc.selectFirst("a.sr.sr-on")?.cleanLabel() ?: "Main",
+            doc.selectFirst("iframe#streamIframe, iframe[src]")?.attr("src"))
         for (tab in doc.select("a.sr")) {
             if (tab.hasClass("sr-on")) continue
             if (servers.size >= MAX_SERVERS) break
@@ -169,36 +169,52 @@ class FoxTrendProvider : MainAPI() {
         log("servers for $data: ${servers.values}")
         var found = false
         for ((embed, label) in servers.entries.take(MAX_SERVERS)) {
-            val m3u8 = resolveM3u8(embed, referer = data)
-            if (m3u8 == null) {
+            val link = resolveM3u8(embed, referer = data)
+            if (link == null) {
                 log("$label ($embed): no m3u8")
                 continue
             }
-            val embedOrigin = originOf(embed) ?: origin
+            val (m3u8, playRef, ua) = link
             callback(
                 newExtractorLink("FoxTrend", "FoxTrend — $label", m3u8, ExtractorLinkType.M3U8) {
-                    this.referer = "$embedOrigin/"
+                    this.referer = playRef ?: (originOf(embed)?.plus("/") ?: "$origin/")
                     this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("User-Agent" to USER_AGENT)
+                    this.headers = mapOf("User-Agent" to (ua ?: USER_AGENT))
                 }
             )
-            log("$label: $m3u8")
+            log("$label: $m3u8 (ref=$playRef)")
             found = true
         }
         return found
     }
 
-    /** Load [embedUrl] in a headless WebView and return the first `.m3u8` it requests. */
-    private suspend fun resolveM3u8(embedUrl: String, referer: String): String? = runCatching {
-        app.get(
-            embedUrl,
-            referer = referer,
-            interceptor = WebViewResolver(
-                interceptUrl = Regex("""\.m3u8"""),
-                timeout = WEBVIEW_TIMEOUT_MS,
-            ),
-        ).url.takeIf { ".m3u8" in it }
+    /**
+     * Load [embedUrl] in a WebView and return the first `.m3u8` it requests, with the Referer
+     * and User-Agent the player used (the CDN needs them for playback).
+     *
+     * A headless WebView never autoplays (no user gesture, and the setting can't be changed from
+     * here), and these players only fetch the HLS manifest once playback is asked for. The manifest
+     * request is a plain XHR, though, not gated by the media-gesture policy — so [PLAY_SCRIPT]
+     * nudges the player to start, which fires the manifest fetch we intercept, even if the <video>
+     * itself stays paused. Native WebView networking (useOkhttp = false) keeps the embed's cookies,
+     * Sec-Fetch headers and redirects intact through its anti-bot/WASM handshake.
+     */
+    private suspend fun resolveM3u8(embedUrl: String, referer: String): Triple<String, String?, String?>? = runCatching {
+        val resolver = WebViewResolver(
+            interceptUrl = Regex("""\.m3u8"""),
+            useOkhttp = false,
+            script = PLAY_SCRIPT,
+            timeout = WEBVIEW_TIMEOUT_MS,
+        )
+        val request = resolver.resolveUsingWebView(embedUrl, referer).first
+        val url = request?.url?.toString()?.takeIf { ".m3u8" in it } ?: return@runCatching null
+        Triple(url, request.header("Referer"), request.header("User-Agent"))
     }.onFailure { log("webview $embedUrl: $it") }.getOrNull()
+
+    private fun fixProto(src: String): String = when {
+        src.startsWith("//") -> "https:$src"
+        else -> src
+    }
 
     /**
      * The schedule host rotates; the hub always lists the current FoxTrend landing,
@@ -226,20 +242,33 @@ class FoxTrendProvider : MainAPI() {
 
     private fun originOf(url: String): String? = Regex("""^https?://[^/]+""").find(url)?.value
 
-    private fun absUrl(src: String, origin: String): String = when {
-        src.startsWith("http") -> src
-        src.startsWith("//") -> "https:$src"
-        src.startsWith("/") -> origin + src
-        else -> "$origin/$src"
-    }
-
     private fun log(message: String) = Log.d("FoxTrend", message)
 
     companion object {
         private const val HUB = "https://foxlink.buzz/"
         private const val DEFAULT_BASE = "https://foxtrend.fyi"
         private const val MAX_SERVERS = 3
-        private const val WEBVIEW_TIMEOUT_MS = 25_000L
+        private const val WEBVIEW_TIMEOUT_MS = 30_000L
+
+        // Injected into each embed on every resource load. It mutes and asks every player/video to
+        // start, which makes jwplayer/hls.js fetch the HLS manifest (a plain XHR, allowed without a
+        // user gesture) so we can intercept it, even though the WebView never actually autoplays.
+        private val PLAY_SCRIPT = """
+            (function(){
+              if (window.__ftKick) return; window.__ftKick = 1;
+              var n = 0;
+              var t = setInterval(function(){
+                n++;
+                try { if (window.jwplayer) { var p = window.jwplayer();
+                  if (p) { try { p.setMute && p.setMute(true); } catch(e){} try { p.play && p.play(); } catch(e){} } } } catch(e){}
+                try { var vs = document.getElementsByTagName('video');
+                  for (var i=0;i<vs.length;i++){ vs[i].muted = true; try { var pr = vs[i].play(); if (pr && pr.catch) pr.catch(function(){}); } catch(e){} } } catch(e){}
+                try { var b = document.querySelector('.jw-icon-display,.jw-display-icon-container,.vjs-big-play-button,[class*=play-button],[aria-label*=play i]');
+                  if (b) b.click(); } catch(e){}
+                if (n > 45) clearInterval(t);
+              }, 700);
+            })();
+        """.trimIndent()
         private const val USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 

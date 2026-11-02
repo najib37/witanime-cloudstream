@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 1
+version = 2
 
 cloudstream {
     description = "FoxTrend / StreamEast sports (via foxlink.buzz) — live F1, football, NBA, NFL and more"
